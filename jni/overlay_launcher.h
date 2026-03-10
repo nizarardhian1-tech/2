@@ -1,8 +1,12 @@
 #pragma once
 // =============================================================================
 // overlay_launcher.h — Launch overlay via app_process + APK sebagai CLASSPATH
-// uk.lgl.OverlayMain sudah terkompile di dalam APK kita (src/uk/lgl/)
-// Tidak perlu overlay.dex terpisah
+//
+// LaunchOverlay(apkPath, gamePkg):
+//   - gamePkg dikirim sebagai argv[1] ke OverlayMain.main(String[] args)
+//   - OverlayMain pakai gamePkg untuk konstruksi SHM path:
+//       /data/data/<gamePkg>/files/tool_esp.shm
+//   - Tidak ada hardcoded package name di sisi overlay
 // =============================================================================
 #include <unistd.h>
 #include <sys/wait.h>
@@ -21,7 +25,10 @@ static const char* _FindAppProcess() {
     return nullptr;
 }
 
-static bool LaunchOverlay(const char* apkPath) {
+// apkPath  = CLASSPATH (path APK mod kita)
+// gamePkg  = package name game target, dikirim ke OverlayMain sebagai args[0]
+//            sehingga OverlayMain tahu path SHM: /data/data/<gamePkg>/files/tool_esp.shm
+static bool LaunchOverlay(const char* apkPath, const char* gamePkg = nullptr) {
     if (!apkPath || !apkPath[0]) return false;
     const char* appProc = _FindAppProcess();
     if (!appProc) return false;
@@ -30,7 +37,12 @@ static bool LaunchOverlay(const char* apkPath) {
     if (pid < 0) return false;
     if (pid == 0) {
         setenv("CLASSPATH", apkPath, 1);
-        execl(appProc, appProc, "/", OVERLAY_CLASS, nullptr);
+        if (gamePkg && gamePkg[0]) {
+            // argv: appProc "/" OVERLAY_CLASS gamePkg null
+            execl(appProc, appProc, "/", OVERLAY_CLASS, gamePkg, nullptr);
+        } else {
+            execl(appProc, appProc, "/", OVERLAY_CLASS, nullptr);
+        }
         _exit(1);
     }
     sleep(1);

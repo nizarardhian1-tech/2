@@ -122,14 +122,23 @@ public class OverlayMain {
             return;
         }
 
-        // Tunggu SHM dari libinternal.so siap (tetap ada untuk ESP)
-        final SHMBridge shm = new SHMBridge();
+        // args[0] = gamePkg (dikirim dari LaunchOverlay di injector_main.cpp)
+        // SHM path: /data/data/<gamePkg>/files/tool_esp.shm
+        // Persis seperti MLBB-Mod: overlay hanya polling SHM file,
+        // tidak perlu tunggu library dimuat — cukup tunggu file ada + ready flag.
+        final String gamePkg = (args != null && args.length > 0 && args[0] != null) ? args[0] : "";
+        System.err.println("[OverlayMain] gamePkg=" + gamePkg);
+
+        final SHMBridge shm = new SHMBridge(gamePkg);
+        System.err.println("[OverlayMain] SHM path=" + shm.getPath());
+
         final Handler mainHandler = new Handler(Looper.getMainLooper());
 
         Thread shmThread = new Thread(new Runnable() {
             @Override
             public void run() {
-                // Coba connect ke SHM file (dibuat oleh libinternal.so)
+                // Poll sampai SHM file tersedia (dibuat libinternal.so setelah inject)
+                // Timeout 120 detik
                 boolean connected = false;
                 for (int i = 0; i < 120 && !connected; i++) {
                     connected = shm.connect();
@@ -137,8 +146,10 @@ public class OverlayMain {
                         try { Thread.sleep(1000); } catch (Exception e2) { /* */ }
                     }
                 }
-                // Apakah SHM konek atau tidak, tetap launch overlay
-                // ImGui bisa berjalan tanpa SHM (SHM hanya untuk ESP Canvas)
+                System.err.println("[OverlayMain] SHM connected=" + connected
+                    + " path=" + shm.getPath());
+                // Mau connect atau tidak, tetap launch overlay
+                // ImGui berjalan tanpa SHM; Canvas ESP butuh SHM
                 final boolean shmOk = connected;
                 mainHandler.post(new Runnable() {
                     @Override

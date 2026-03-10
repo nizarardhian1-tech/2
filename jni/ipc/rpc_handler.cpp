@@ -288,4 +288,240 @@ void RpcHandler::registerAll() {
     });
 
     LOGI("All RPC handlers registered.");
+
+    // ── ESP SHM handlers (start_esp / stop_esp) ───────────────────────────────
+    _RegisterESPHandlers();
+}
+
+// =============================================================================
+// ESP SHM WRITER — start_esp / stop_esp
+//
+// Persis seperti MLBB-Mod esp_thread, tapi generic:
+//   - class_ptr dikirim dari overlay via IPC (user pilih dari class browser)
+//   - Scan GC objects setiap ~50ms
+//   - Tulis posisi ke g_shm->entities[]
+//   - OverlayESP.java (Canvas) baca SHM → gambar di layar
+// =============================================================================
+
+#include "../shared_data.h"
+#include "../internal/shm.h"   // g_shm
+
+#include <atomic>
+#include <thread>
+#include <chrono>
+#include <cstring>
+#include <cmath>
+
+// ── ESP thread state ──────────────────────────────────────────────────────────
+static std::atomic<bool>  s_espRunning{false};
+static std::atomic<bool>  s_espStop{false};
+static std::thread        s_espThread;
+
+// ── Vec3 helper ───────────────────────────────────────────────────────────────
+struct _Vec3 { float x=0,y=0,z=0; };
+
+// ── W2S helper (via UnityEngine.Camera) ───────────────────────────────────────
+static Il2CppObject* s_camera    = nullptr;
+static MethodInfo*   s_w2sMth    = nullptr;
+static bool          s_camReady  = false;
+static int           s_camW=0, s_camH=0;
+
+static bool _InitCam() {
+    if (s_camReady) return true;
+    try {
+        auto *cc = Il2cpp::FindClass("UnityEngine.Camera");
+        if (!cc) return false;
+        s_camera = cc->invoke_static_method<Il2CppObject*>("get_main");
+        if (!s_camera || !IsPtrValid(s_camera)) { s_camera=nullptr; return false; }
+        for (auto *m : cc->getMethods("WorldToScreenPoint"))
+            if (m && m->methodPointer && m->getParamsInfo().size()==1) { s_w2sMth=m; break; }
+        if (!s_w2sMth) return false;
+        try { s_camW = s_camera->invoke_method<int>("get_pixelWidth");  } catch(...) { s_camW=0; }
+        try { s_camH = s_camera->invoke_method<int>("get_pixelHeight"); } catch(...) { s_camH=0; }
+        if (s_camW <= 0 && g_shm) s_camW = g_shm->screenW;
+        if (s_camH <= 0 && g_shm) s_camH = g_shm->screenH;
+        s_camReady = true;
+    } catch(...) { return false; }
+    return true;
+}
+
+static bool _W2S(_Vec3 world, float &sx, float &sy) {
+    if (!s_camera || !s_w2sMth || s_camW<=0 || s_camH<=0) return false;
+    if (!IsPtrValid(s_camera)) { s_camReady=false; s_camera=nullptr; return false; }
+    _Vec3 s{};
+    try { s = s_w2sMth->invoke_static<_Vec3>(s_camera, world); }
+    catch(...) { return false; }
+    if (s.z <= 0.1f) return false;
+    float scaleX = g_shm ? (float)g_shm->screenW / (float)s_camW : 1.f;
+    float scaleY = g_shm ? (float)g_shm->screenH / (float)s_camH : 1.f;
+    sx = s.x * scaleX;
+    sy = (g_shm ? g_shm->screenH : s_camH) - (s.y * scaleY);
+    return true;
+}
+
+// ── ESP scan thread ───────────────────────────────────────────────────────────
+static void _EspThreadFn(Il2CppClass* klass, int posMode,
+                          uintptr_t fieldOffset, uintptr_t methodPtr) {
+    LOGI("[ESP] Thread started. class=%p posMode=%d fieldOff=0x%zx methodPtr=0x%zx",
+         (void*)klass, posMode, fieldOffset, methodPtr);
+
+    MethodInfo* posMethod = methodPtr ? reinterpret_cast<MethodInfo*>(methodPtr) : nullptr;
+
+    // Cache Transform methods untuk mode 2
+    MethodInfo *getTransform = nullptr, *getPosition = nullptr;
+    if (posMode == 2) {
+        auto *tc = Il2cpp::FindClass("UnityEngine.Transform");
+        auto *cc = Il2cpp::FindClass("UnityEngine.Component");
+        if (tc) getPosition  = tc->getMethod("get_position", 0);
+        if (cc) getTransform = cc->getMethod("get_transform", 0);
+    }
+
+    while (!s_espStop.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50)); // ~20fps
+
+        if (!g_shm || s_espStop.load()) break;
+
+        _InitCam();
+
+        std::vector<Il2CppObject*> objects;
+        try {
+            objects = Il2cpp::GC::FindObjects(klass);
+        } catch(...) { continue; }
+
+        int count = 0;
+        g_shm->seq++;  // seqlock: mulai tulis
+
+        for (auto* obj : objects) {
+            if (s_espStop.load() || count >= MAX_ENTITIES) break;
+            if (!obj || !IsPtrValid(obj)) continue;
+
+            _Vec3 pos{};
+            bool gotPos = false;
+
+            switch (posMode) {
+                case 0: // FieldDirect
+                    if (fieldOffset) {
+                        gotPos = SafeRead<_Vec3>((const void*)((uintptr_t)obj + fieldOffset), &pos);
+                    }
+                    break;
+                case 1: // MethodInvoke
+                    if (posMethod && posMethod->methodPointer) {
+                        try { pos = posMethod->invoke_static<_Vec3>(obj); gotPos=true; }
+                        catch(...) {}
+                    }
+                    break;
+                case 2: // TransformChain
+                    try {
+                        Il2CppObject* tr = nullptr;
+                        if (getTransform) tr = getTransform->invoke_static<Il2CppObject*>(obj);
+                        if (tr && IsPtrValid(tr) && getPosition) {
+                            pos = getPosition->invoke_static<_Vec3>(tr);
+                            gotPos = true;
+                        }
+                    } catch(...) {}
+                    break;
+            }
+
+            if (!gotPos) continue;
+            if (pos.x!=pos.x || pos.y!=pos.y || pos.z!=pos.z) continue; // NaN
+
+            ShmEntity& e = g_shm->entities[count];
+            memset(&e, 0, sizeof(ShmEntity));
+            e.worldX = pos.x; e.worldY = pos.y; e.worldZ = pos.z;
+
+            float sx=0, sy=0;
+            if (_W2S(pos, sx, sy)) {
+                e.screenX = sx; e.screenY = sy;
+                // head: estimasi 2 meter di atas kaki
+                _Vec3 headPos{pos.x, pos.y + 2.f, pos.z};
+                float hx=0, hy=0;
+                if (_W2S(headPos, hx, hy)) { e.headX=hx; e.headY=hy; }
+            }
+
+            // Jarak dari self
+            if (g_shm) {
+                float dx=pos.x-g_shm->screenW*0.5f, dz=pos.z;
+                // Fallback simple distance
+                e.distance = sqrtf(dx*dx + pos.y*pos.y + dz*dz);
+            }
+
+            // Tag dari nama class
+            const char* cn = klass->getName();
+            if (cn) strncpy(e.tag, cn, sizeof(e.tag)-1);
+
+            e.isValid = true;
+            count++;
+        }
+
+        g_shm->entityCount = count;
+        g_shm->seq++;  // seqlock: selesai tulis
+    }
+
+    // Bersihkan saat stop
+    if (g_shm) {
+        g_shm->seq++;
+        memset(g_shm->entities, 0, sizeof(g_shm->entities));
+        g_shm->entityCount = 0;
+        g_shm->seq++;
+    }
+    s_espRunning.store(false);
+    LOGI("[ESP] Thread stopped.");
+}
+
+// ── Daftarkan ke IPCServer (dipanggil dari registerAll) ───────────────────────
+static void _RegisterESPHandlers() {
+    IPCServer& srv = IPCServer::get();
+
+    // start_esp
+    srv.registerHandler(IPC::CMD_START_ESP, [](const json& params) -> json {
+        // Stop ESP lama kalau ada
+        if (s_espRunning.load()) {
+            s_espStop.store(true);
+            if (s_espThread.joinable()) s_espThread.join();
+            s_espRunning.store(false);
+            s_espStop.store(false);
+        }
+
+        uintptr_t classAddr   = parseAddr(params.value("class_ptr",   std::string("")));
+        int       posMode     = params.value("pos_mode",    0);
+        uintptr_t fieldOffset = (uintptr_t)params.value("field_offset", 0);
+        uintptr_t methodAddr  = parseAddr(params.value("method_ptr",  std::string("")));
+
+        if (!classAddr)
+            return {{"ok", false}, {"error", "invalid class_ptr"}};
+
+        auto* klass = reinterpret_cast<Il2CppClass*>(classAddr);
+        if (!klass || !IsPtrValid(klass))
+            return {{"ok", false}, {"error", "class_ptr invalid or not mapped"}};
+
+        s_espStop.store(false);
+        s_espRunning.store(true);
+        s_espThread = std::thread(_EspThreadFn, klass, posMode, fieldOffset, methodAddr);
+        s_espThread.detach();
+
+        LOGI("[ESP] start_esp: class=%p posMode=%d fieldOff=0x%zx",
+             (void*)klass, posMode, fieldOffset);
+        return {{"ok", true}, {"data", {{"tracking", klass->getName() ? klass->getName() : "?"}}}};
+    });
+
+    // stop_esp
+    srv.registerHandler(IPC::CMD_STOP_ESP, [](const json& params) -> json {
+        s_espStop.store(true);
+        // Thread detached, tidak perlu join
+        LOGI("[ESP] stop_esp called");
+        return {{"ok", true}};
+    });
+}
+
+// ── Patch registerAll() — tambahkan panggilan ke _RegisterESPHandlers ─────────
+// CATATAN: Fungsi ini dipanggil di akhir registerAll() di atas.
+// Karena kita tidak bisa mengubah definisi fungsi dari sini, kita
+// tambahkan init di sini dan panggil via constructor trick.
+namespace {
+    struct _ESPAutoRegister {
+        _ESPAutoRegister() {
+            // Tidak bisa register di sini karena IPCServer belum start.
+            // _RegisterESPHandlers() dipanggil manual dari registerAll().
+        }
+    };
 }

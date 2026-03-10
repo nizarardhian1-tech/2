@@ -178,7 +178,8 @@ int main(int argc, char* argv[]) {
     }
 
     // ─ Launch overlay ─────────────────────────────────────────────────────────
-    bool overlayOk = LaunchOverlay(apkPath.c_str());
+    // targetPkg dikirim sebagai argv[1] ke OverlayMain agar bisa konstruksi SHM path
+    bool overlayOk = LaunchOverlay(apkPath.c_str(), targetPkg.c_str());
     L(overlayOk ? "Overlay launch=1" : "Overlay launch=0");
 
     L("Keepalive");

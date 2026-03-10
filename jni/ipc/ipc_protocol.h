@@ -108,6 +108,14 @@ namespace IPC {
     static constexpr const char* CMD_DUMP_CLASSES = "dump_classes";
     static constexpr const char* CMD_GET_LIB_BASE = "get_lib_base";
     static constexpr const char* CMD_SET_VALUE    = "set_value";
+    // ── ESP commands (libimgui_ext → libinternal → SHM) ──────────────────────
+    // start_esp: suruh libinternal scan class + tulis posisi ke SHM
+    //   params: { "class_ptr": "0x...", "pos_mode": 0|1|2,
+    //             "field_offset": 0x..., "method_ptr": "0x..." }
+    //   pos_mode: 0=FieldDirect(baca field Vector3), 1=MethodInvoke(panggil method),
+    //             2=TransformChain(get_transform → get_position)
+    static constexpr const char* CMD_START_ESP    = "start_esp";
+    static constexpr const char* CMD_STOP_ESP     = "stop_esp";
 }
 
 #endif // IPC_PROTOCOL_H

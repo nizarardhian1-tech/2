@@ -68,10 +68,13 @@
 #include "json/single_include/nlohmann/json.hpp"
 
 // ── IPC Server ────────────────────────────────────────────────────────────────
-// Path relatif ke struktur Proyek 2 + tambahan ipc/ folder
-// Salin ipc_server.h / ipc_server.cpp / ipc_protocol.h ke jni/ipc/
 #include "ipc/ipc_server.h"
 #include "ipc/rpc_handler.h"
+
+// ── SHM — sama dengan arsitektur MLBB-Mod ─────────────────────────────────────
+// libinternal.so (game process) tulis SHM → OverlayMain (app_process) baca SHM
+// Path SHM diderivasi otomatis dari /proc/self/cmdline (pkg name game)
+#include "shm.h"
 
 #define targetLibName OBFUSCATE("libil2cpp.so")
 
@@ -391,6 +394,12 @@ void on_init() {
     // 1. Tunggu libil2cpp.so
     waitForLib((const char*)targetLibName);
 
+    // FIX TIMING: Sama dengan MLBB-Mod esp_thread — sleep 3 detik SETELAH
+    // library ditemukan di /proc/self/maps. Library ada di memory tapi
+    // constructors-nya belum tentu selesai jalan → crash kalau langsung Init().
+    LOGI("[on_init] libil2cpp found, sleeping 3s before Init...");
+    sleep(3);
+
     // 2. Detect & set target lib
     LOGI("[on_init] Il2cpp::Init ...");
     Il2cpp::Init();
@@ -504,13 +513,29 @@ void on_init() {
     Java_ShowToast("Tool Loaded! IPC Ready.");
     Java_SendNotification("IL2CPP Tool", "Hybrid mode active — ImGui via overlay");
 
+    // 12. Set SHM ready — overlay tahu bahwa internal sudah fully initialized
+    if (g_shm) {
+        g_shm->ready = true;
+        LOGI("[on_init] SHM ready flag set");
+    }
+
     LOGI("[on_init] ===== DONE =====");
 }
 
 // ── hack_thread ────────────────────────────────────────────────────────────────
 static void* hack_thread(void*) {
-    // Tunggu sebentar agar proses stabil setelah inject
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    // FIX: Jangan langsung on_init() — init SHM dulu agar overlay bisa connect
+    // segera setelah injector selesai, bahkan sebelum IL2CPP ready.
+    if (!SHM_Init()) {
+        LOGE("[libinternal] SHM_Init failed, continuing without SHM");
+    } else {
+        LOGI("[libinternal] SHM ready at: %s", g_shm_real_path);
+    }
+
+    // Tunggu proses stabil setelah inject (sama dengan MLBB-Mod: sleep sebelum init)
+    // 500ms terlalu singkat — game masih loading, crash!
+    sleep(2);
+
     on_init();
     return nullptr;
 }
@@ -534,4 +559,10 @@ void lib_entry() {
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
     pthread_create(&tid, &attr, hack_thread, nullptr);
     pthread_attr_destroy(&attr);
+}
+
+// ── Destructor: dipanggil saat library di-unload ──────────────────────────────
+__attribute__((destructor))
+void lib_exit() {
+    SHM_Cleanup();
 }
