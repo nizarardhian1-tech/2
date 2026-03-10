@@ -1,0 +1,26 @@
+# exports.map — Linker version script untuk libimgui_ext.so
+#
+# Hanya simbol JNI (Java_*) dan JNI_OnLoad yang di-export (visible).
+# Semua simbol lain di-hide agar tidak konflik dengan simbol di proses game.
+#
+# Ini penting karena libimgui_ext.so di-load di app_process,
+# bukan di proses game, jadi tidak ada konflik linker antar library.
+# Tapi tetap good practice untuk minimize exported symbols.
+
+{
+  global:
+    # JNI entry points — harus visible untuk JNI framework
+    Java_uk_lgl_OverlayMain_nativeInitImGui;
+    Java_uk_lgl_OverlayMain_nativeInjectTouch;
+    Java_uk_lgl_OverlayMain_nativeOnSurfaceChanged;
+    Java_uk_lgl_OverlayMain_nativeDestroy;
+    Java_uk_lgl_OverlayMain_nativeWantsCapture;
+    Java_uk_lgl_OverlayMain_nativeIsRunning;
+    # JNI lifecycle
+    JNI_OnLoad;
+    JNI_OnUnload;
+
+  local:
+    # Semua simbol lain hidden
+    *;
+};

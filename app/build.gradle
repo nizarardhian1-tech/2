@@ -1,0 +1,42 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.hybrid.imgui'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.hybrid.imgui"
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt')
+        }
+        debug {
+            debuggable true
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    // Tidak pakai XML layout sama sekali — semua programmatic
+    sourceSets {
+        main {
+            res.srcDirs = []
+        }
+    }
+}
+
+dependencies {
+    // Minimal — tidak pakai AndroidX agar APK kecil
+}

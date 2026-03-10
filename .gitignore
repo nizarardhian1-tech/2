@@ -1,0 +1,24 @@
+# Build outputs
+build/
+*.so
+*.o
+
+# Android Studio
+.gradle/
+.idea/
+*.iml
+local.properties
+captures/
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# JSON config runtime
+tool_conf.json
+
+# OS
+.DS_Store
+Thumbs.db
