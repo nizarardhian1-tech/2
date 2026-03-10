@@ -290,7 +290,7 @@ void RpcHandler::registerAll() {
     LOGI("All RPC handlers registered.");
 
     // ── ESP SHM handlers (start_esp / stop_esp) ───────────────────────────────
-    _RegisterESPHandlers();
+
 }
 
 // =============================================================================
