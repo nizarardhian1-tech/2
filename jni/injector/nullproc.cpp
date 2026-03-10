@@ -6,6 +6,12 @@
 #include <unistd.h>
 #include <cerrno>
 #include <cstring>
+#include <android/log.h>
+
+// Logging helper — tulis ke logcat DAN ke stderr (visible di injector_log jika ada)
+#define ILOG(fmt, ...) \
+    __android_log_print(ANDROID_LOG_DEBUG, "NullInject", fmt, ##__VA_ARGS__); \
+    fprintf(stderr, "[NullInject] " fmt "\n", ##__VA_ARGS__)
 
 NullProcess::Process::Process() {
     this->pid     = -1;
@@ -91,17 +97,14 @@ std::string NullProcess::Process::readProcessMemory(uintptr_t address, size_t le
     return NullUtils::bytesToHex(readData, len);
 }
 
-// ==========================================
-// INJECT FROM FILE → MEMFD (wrapper)
-// Baca .so dari disk ke buffer, inject via memfd
-// File di disk bisa dihapus setelah ini
-// ==========================================
-
+// ============================================================================
+// injectLibraryFromFile — baca .so dari disk lalu inject via memfd
+// ============================================================================
 bool NullProcess::Process::injectLibraryFromFile(const std::string& path) {
-    // Baca file ke buffer
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file.is_open()) {
-        // std::cerr << "[inject] Gagal buka file: " << path << "\n";
+        ILOG("injectLibraryFromFile: GAGAL buka file '%s' (errno=%d: %s)",
+             path.c_str(), errno, strerror(errno));
         return false;
     }
 
@@ -110,21 +113,18 @@ bool NullProcess::Process::injectLibraryFromFile(const std::string& path) {
 
     std::vector<uint8_t> buffer(size);
     if (!file.read(reinterpret_cast<char*>(buffer.data()), size)) {
-        // std::cerr << "[inject] Gagal baca file\n";
+        ILOG("injectLibraryFromFile: GAGAL baca file (size=%ld)", (long)size);
         return false;
     }
     file.close();
+    ILOG("injectLibraryFromFile: baca %ld bytes dari '%s'", (long)size, path.c_str());
 
-    // std::cout << "[inject] Baca " << size << " bytes dari " << path << "\n";
-
-    // Inject via memfd — file bisa dihapus setelah ini
     return this->injectLibraryMemfd(buffer.data(), buffer.size());
 }
 
-// ==========================================
-// INJECT LIBRARY
-// ==========================================
-
+// ============================================================================
+// injectLibrary — inject via dlopen path (fallback)
+// ============================================================================
 bool NullProcess::Process::injectLibrary(std::string path) {
     struct stat buffer;
     if (stat(path.c_str(), &buffer) != 0) return false;
@@ -153,23 +153,9 @@ bool NullProcess::Process::injectLibrary(std::string path) {
     void* pathAddr = this->remoteString(path);
     if (pathAddr == nullptr) return false;
 
-    // Cari libLR_base (libart.so atau libRS.so sebagai return address base)
     uintptr_t libLR_base = 0x0;
-
     for (const NullProcess::Map& map : this->maps) {
-#if defined(__x86_64__) || defined(__i386__)
-        if (map.pathName.find("system/lib64/libart.so")  != std::string::npos ||
-            map.pathName.find("system/lib/libart.so")    != std::string::npos ||
-            // APEX Android 10+
-            (map.pathName.find("/apex/") != std::string::npos &&
-             map.pathName.find("libart.so") != std::string::npos)) {
-            libLR_base = map.start; break;
-        }
-        if (map.pathName.find("system/lib64/libRS.so") != std::string::npos ||
-            map.pathName.find("system/lib/libRS.so")   != std::string::npos) {
-            libLR_base = map.start; break;
-        }
-#elif defined(__arm__) || defined(__aarch64__)
+#if defined(__arm__) || defined(__aarch64__)
         if (map.pathName.find("libart.so") != std::string::npos) {
             libLR_base = map.start; break;
         }
@@ -178,23 +164,9 @@ bool NullProcess::Process::injectLibrary(std::string path) {
         }
 #endif
     }
-
-    // Fallback libLR ke libc jika libart tidak ditemukan
     if (!libLR_base) {
         for (const NullProcess::Map& map : this->maps) {
-#if defined(__x86_64__) || defined(__i386__)
-            if (NullUtils::getApiLevel() < 29) {
-                if (map.pathName.find("system/lib64/libc.so") != std::string::npos ||
-                    map.pathName.find("system/lib/libc.so")   != std::string::npos) {
-                    libLR_base = map.start; break;
-                }
-            } else {
-                if (map.pathName.find("/apex/") != std::string::npos &&
-                    map.pathName.find("libc.so") != std::string::npos) {
-                    libLR_base = map.start; break;
-                }
-            }
-#elif defined(__arm__) || defined(__aarch64__)
+#if defined(__arm__) || defined(__aarch64__)
             if (map.pathName.find("libc.so") != std::string::npos) {
                 libLR_base = map.start; break;
             }
@@ -202,41 +174,16 @@ bool NullProcess::Process::injectLibrary(std::string path) {
         }
     }
 
-    if (shouldEmuInject) {
-        if (!this->injectLibNB(pathAddr, libLR_base)) {
-            this->call<void>(this->libc.remote_free, pathAddr);
-            return false;
-        }
-        this->call<void>(this->libc.remote_free, pathAddr);
-        return true;
-    } else {
-        void* handle = this->callR<void*>(libLR_base, this->libdl.remote_dlopen,
-                                          pathAddr, RTLD_NOW | RTLD_GLOBAL);
-        if (!handle) {
-            uintptr_t errnoMsg = this->call<uintptr_t>(this->libdl.remote_dlerror);
-            if (errnoMsg) {
-                std::vector<uint8_t> errnoChars =
-                    NullUtils::interpretHex(this->readProcessMemory(errnoMsg, 500));
-                // std::cerr << "DlError: ";
-                for (unsigned char c : errnoChars) {
-                    if (c == 0x0) break;
-                    // std::cerr << (char)c;
-                }
-                // std::cerr << "\n";
-            }
-            this->call<void>(this->libc.remote_free, pathAddr);
-            return false;
-        }
-        this->call<void>(this->libc.remote_free, pathAddr);
-        return true;
-    }
+    void* handle = this->callR<void*>(libLR_base, this->libdl.remote_dlopen,
+                                      pathAddr, RTLD_NOW | RTLD_GLOBAL);
+    this->call<void>(this->libc.remote_free, pathAddr);
+    return handle != nullptr;
 }
 
 bool NullProcess::Process::injectLibNB(void* pathAddr, uintptr_t libLR_base) {
     if (!this->nbInfo.nativeBridgeActive) return false;
 
     void* handle = nullptr;
-
     if (this->nbInfo.usesCallbacksPtr) {
         if (NullUtils::getApiLevel() >= 26)
             handle = this->callR<void*>(libLR_base,
@@ -256,73 +203,66 @@ bool NullProcess::Process::injectLibNB(void* pathAddr, uintptr_t libLR_base) {
                 libnativebridge.remote_loadLibrary,
                 pathAddr, RTLD_GLOBAL | RTLD_NOW);
     }
-
-    if (!handle) {
-        uintptr_t errnoMsg;
-        if (this->nbInfo.usesCallbacksPtr)
-            errnoMsg = this->callR<uintptr_t>(libLR_base,
-                reinterpret_cast<uintptr_t>(nbCallbacks.getError));
-        else
-            errnoMsg = this->callR<uintptr_t>(libLR_base,
-                libnativebridge.remote_getError);
-
-        if (errnoMsg) {
-            std::vector<uint8_t> errnoChars =
-                NullUtils::interpretHex(this->readProcessMemory(errnoMsg, 500));
-            // std::cerr << "NativeBridgeError: ";
-            for (unsigned char c : errnoChars) {
-                if (c == 0x0) break;
-                // std::cerr << (char)c;
-            }
-            // std::cerr << "\n";
-        }
-        return false;
-    }
-
-    return true;
+    return handle != nullptr;
 }
 
-// ==========================================
-// INJECT LIBRARY FROM MEMORY (memfd_create)
-// Strategy: game buat memfd-nya sendiri via remote syscall
-// Kita tulis bytes ke /proc/<game_pid>/fd/<remote_fd>
-// Game dlopen("/proc/self/fd/<n>") - fully local, bypass SELinux
-// ==========================================
-
+// ============================================================================
+// injectLibraryMemfd — inject dari buffer memory menggunakan memfd_create
+// Strategy: buat memfd di proses game via remote syscall, tulis bytes,
+//           game dlopen("/proc/self/fd/<n>") — bypass SELinux file context
+// ============================================================================
 bool NullProcess::Process::injectLibraryMemfd(const uint8_t* data, size_t size) {
     if (!data || size == 0) {
-        // std::cerr << "[memfd] Data kosong!\n";
+        ILOG("injectLibraryMemfd: data kosong");
         return false;
     }
 
+    // Cek symbols — jika locateSymbols() gagal, ini akan 0
     if (!this->libc.remote_malloc || !this->libc.remote_free ||
         !this->libdl.remote_dlopen) {
-        // std::cerr << "[memfd] Symbols belum siap!\n";
+        ILOG("injectLibraryMemfd: symbols belum siap! malloc=%p free=%p dlopen=%p",
+             (void*)this->libc.remote_malloc,
+             (void*)this->libc.remote_free,
+             (void*)this->libdl.remote_dlopen);
         return false;
     }
+    ILOG("injectLibraryMemfd: symbols OK. malloc=%p dlopen=%p",
+         (void*)this->libc.remote_malloc, (void*)this->libdl.remote_dlopen);
 
-    // Step 1: Cari alamat syscall() di libc remote
+    // Cari syscall() di libc remote
     uintptr_t remote_syscall = 0;
     for (const NullProcess::Map& map : this->maps) {
         if (NullUtils::endsWith(map.pathName, "libc.so")) {
             uintptr_t sym = NullElf::getAddrSym(map.pathName.c_str(), "syscall");
             if (sym) {
                 remote_syscall = map.start + sym;
-                // std::cout << "[memfd] remote syscall @ 0x" << std::hex << remote_syscall << std::dec << "\n";
+                ILOG("remote syscall @ 0x%lx (libc: %s)", (unsigned long)remote_syscall, map.pathName.c_str());
                 break;
             }
         }
     }
     if (!remote_syscall) {
-        // std::cerr << "[memfd] Gagal temukan syscall di libc remote!\n";
+        ILOG("injectLibraryMemfd: GAGAL temukan syscall di libc remote!");
+        ILOG("Daftar maps libc:");
+        for (const NullProcess::Map& map : this->maps) {
+            if (map.pathName.find("libc") != std::string::npos)
+                ILOG("  %s", map.pathName.c_str());
+        }
         return false;
     }
 
-    // Step 2: Remote call memfd_create di dalam proses game
-    // Nama yang menyerupai mapping internal Android/ART yang normal
+    // Remote call memfd_create di proses game
     void* nameAddr = this->remoteString("dalvik-jit-code-cache");
     if (!nameAddr) {
-        // std::cerr << "[memfd] Gagal tulis string ke remote!\n";
+        ILOG("injectLibraryMemfd: GAGAL remoteString (ptrace attach gagal?)");
+        // Test ptrace manual
+        if (!NullTrace::ptraceAttachWithRetry(this->pid)) {
+            ILOG("ptrace ATTACH GAGAL untuk PID=%d (errno=%d: %s)",
+                 this->pid, errno, strerror(errno));
+        } else {
+            ILOG("ptrace attach OK, tapi remoteString gagal");
+            ptrace(PTRACE_DETACH, this->pid, nullptr, nullptr);
+        }
         return false;
     }
 
@@ -335,23 +275,22 @@ bool NullProcess::Process::injectLibraryMemfd(const uint8_t* data, size_t size) 
     this->call<void>(this->libc.remote_free, nameAddr);
 
     if (remote_fd < 0) {
-        // std::cerr << "[memfd] memfd_create di game gagal! fd=" << remote_fd << "\n";
+        ILOG("injectLibraryMemfd: memfd_create di game gagal! fd=%d", remote_fd);
         return false;
     }
-    // std::cout << "[memfd] Remote memfd fd=" << remote_fd << "\n";
+    ILOG("remote memfd fd=%d", remote_fd);
 
-    // Step 3: Tulis bytes .so ke /proc/<game_pid>/fd/<remote_fd>
+    // Tulis bytes .so ke /proc/<game_pid>/fd/<remote_fd>
     std::string gameFdPath = "/proc/" + std::to_string(this->pid) +
                              "/fd/" + std::to_string(remote_fd);
-    // std::cout << "[memfd] Menulis " << size << " bytes ke " << gameFdPath << "\n";
-
     int localFd = open(gameFdPath.c_str(), O_WRONLY);
     if (localFd < 0) {
-        // std::cerr << "[memfd] Gagal buka game fd path: " << strerror(errno) << "\n";
+        ILOG("injectLibraryMemfd: GAGAL buka game fd path '%s' (errno=%d: %s)",
+             gameFdPath.c_str(), errno, strerror(errno));
         return false;
     }
     if (ftruncate(localFd, static_cast<off_t>(size)) < 0) {
-        // std::cerr << "[memfd] ftruncate gagal: " << strerror(errno) << "\n";
+        ILOG("injectLibraryMemfd: ftruncate gagal");
         close(localFd);
         return false;
     }
@@ -359,65 +298,60 @@ bool NullProcess::Process::injectLibraryMemfd(const uint8_t* data, size_t size) 
     while (written < size) {
         ssize_t w = write(localFd, data + written, size - written);
         if (w <= 0) {
-            // std::cerr << "[memfd] write gagal: " << strerror(errno) << "\n";
+            ILOG("injectLibraryMemfd: write gagal (errno=%d: %s)", errno, strerror(errno));
             close(localFd);
             return false;
         }
         written += w;
     }
     close(localFd);
-    // std::cout << "[memfd] Write selesai!\n";
+    ILOG("tulis %zu bytes ke %s OK", size, gameFdPath.c_str());
 
-    // Step 4: Game dlopen("/proc/self/fd/<remote_fd>") - resolve local di game
-    // CATATAN: tidak lewat injectLibrary() karena stat() akan gagal
-    // (/proc/self/fd/<n> itu fd milik game, bukan fd kita)
+    // Game dlopen("/proc/self/fd/<n>")
     std::string selfFdPath = "/proc/self/fd/" + std::to_string(remote_fd);
-    // std::cout << "[memfd] dlopen path: " << selfFdPath << "\n";
-
     void* pathAddr = this->remoteString(selfFdPath);
     if (!pathAddr) {
-        // std::cerr << "[memfd] Gagal tulis path ke remote!\n";
+        ILOG("injectLibraryMemfd: GAGAL remoteString selfFdPath");
         return false;
     }
 
-    // Cari libLR_base (libart.so) untuk return address
     uintptr_t libLR_base = 0;
     for (const NullProcess::Map& map : this->maps) {
         if (map.pathName.find("libart.so") != std::string::npos) {
-            libLR_base = map.start;
-            break;
+            libLR_base = map.start; break;
         }
     }
     if (!libLR_base) {
         for (const NullProcess::Map& map : this->maps) {
             if (map.pathName.find("libc.so") != std::string::npos) {
-                libLR_base = map.start;
-                break;
+                libLR_base = map.start; break;
             }
         }
     }
+    ILOG("libLR_base = 0x%lx", (unsigned long)libLR_base);
 
     void* handle = this->callR<void*>(libLR_base, this->libdl.remote_dlopen,
                                       pathAddr, RTLD_NOW | RTLD_GLOBAL);
+    this->call<void>(this->libc.remote_free, pathAddr);
+
     if (!handle) {
-        // Print dlerror
+        ILOG("injectLibraryMemfd: dlopen GAGAL! handle=null");
+        // Coba baca dlerror
         uintptr_t errMsg = this->call<uintptr_t>(this->libdl.remote_dlerror);
         if (errMsg) {
             std::vector<uint8_t> errChars =
-                NullUtils::interpretHex(this->readProcessMemory(errMsg, 500));
-            // std::cerr << "[memfd] DlError: ";
+                NullUtils::interpretHex(this->readProcessMemory(errMsg, 256));
+            std::string errStr;
             for (unsigned char c : errChars) {
                 if (c == 0) break;
-                // std::cerr << (char)c;
+                errStr += (char)c;
             }
-            // std::cerr << "\n";
+            ILOG("dlerror: %s", errStr.c_str());
         }
-        this->call<void>(this->libc.remote_free, pathAddr);
         return false;
     }
 
-    this->call<void>(this->libc.remote_free, pathAddr);
-    // std::cout << "[memfd] Inject berhasil via memfd!\n";
+    ILOG("injectLibraryMemfd: BERHASIL! handle=%p", handle);
     return true;
 }
 
@@ -459,10 +393,9 @@ bool NullProcess::Process::processExists(pid_t pid) {
     return false;
 }
 
-// ==========================================
-// LOCATE SYMBOLS - Fix APEX Android 10+ ARM/ARM64
-// ==========================================
-
+// ============================================================================
+// locateSymbols — temukan malloc/free/dlopen di peta memori proses game
+// ============================================================================
 void NullProcess::Process::locateSymbols() {
     this->libdl.remote_dlopen                   = 0x0;
     this->libdl.remote_dlerror                  = 0x0;
@@ -479,13 +412,10 @@ void NullProcess::Process::locateSymbols() {
     bool libcinit  = false;
 
     int apiLevel = NullUtils::getApiLevel();
+    ILOG("locateSymbols: PID=%d apiLevel=%d", this->pid, apiLevel);
 
 #if defined(__arm__) || defined(__aarch64__)
-    // -------------------------------------------------------
-    // ARM / ARM64 - Fix APEX paths untuk Android 10+ (API 29+)
-    // -------------------------------------------------------
     for (const NullProcess::Map& map : this->maps) {
-
         // --- libdl ---
         if (!libdlinit && NullUtils::endsWith(map.pathName, "libdl.so")) {
             uintptr_t sym = NullElf::getAddrSym(map.pathName.c_str(), "dlopen");
@@ -494,23 +424,28 @@ void NullProcess::Process::locateSymbols() {
                 this->libdl.remote_dlerror = map.start + NullElf::getAddrSym(map.pathName.c_str(), "dlerror");
                 this->libdl.remote_dlsym   = map.start + NullElf::getAddrSym(map.pathName.c_str(), "dlsym");
                 libdlinit = true;
+                ILOG("libdl.so dlopen @ 0x%lx", (unsigned long)this->libdl.remote_dlopen);
+            } else {
+                ILOG("libdl.so stub (dlopen=0), akan cari di linker");
             }
-            // Jika sym == 0, berarti libdl.so adalah stub (Android 10+)
-            // Jangan set libdlinit = true, biarkan fallback ke linker
         }
-
         // --- libc ---
         if (!libcinit && NullUtils::endsWith(map.pathName, "libc.so")) {
             this->libc.remote_malloc = map.start + NullElf::getAddrSym(map.pathName.c_str(), "malloc");
             this->libc.remote_free   = map.start + NullElf::getAddrSym(map.pathName.c_str(), "free");
             this->libc.remote_mmap   = map.start + NullElf::getAddrSym(map.pathName.c_str(), "mmap");
-            if (this->libc.remote_malloc) libcinit = true;
+            if (this->libc.remote_malloc) {
+                libcinit = true;
+                ILOG("libc.so malloc @ 0x%lx", (unsigned long)this->libc.remote_malloc);
+            } else {
+                ILOG("libc.so malloc=0 di path '%s'", map.pathName.c_str());
+            }
         }
     }
 
-    // Fallback libdl untuk Android 10+ (API 29+):
-    // dlopen ada di linker64/linker, bukan di libdl.so stub
+    // Fallback linker64 untuk Android 10+ (dlopen ada di linker, bukan libdl stub)
     if (!libdlinit && apiLevel >= 29) {
+        ILOG("Mencari dlopen di linker64 (Android 10+)...");
         for (const NullProcess::Map& map : this->maps) {
             bool isLinker =
 #if defined(__aarch64__)
@@ -527,13 +462,14 @@ void NullProcess::Process::locateSymbols() {
                     this->libdl.remote_dlerror = map.start + NullElf::getAddrSym(map.pathName.c_str(), "dlerror");
                     this->libdl.remote_dlsym   = map.start + NullElf::getAddrSym(map.pathName.c_str(), "dlsym");
                     libdlinit = true;
+                    ILOG("linker64 dlopen @ 0x%lx (%s)", (unsigned long)this->libdl.remote_dlopen, map.pathName.c_str());
                     break;
                 }
             }
         }
     }
 
-    // Fallback ke libdl_android.so (beberapa vendor Android 10+)
+    // Fallback libdl_android.so
     if (!libdlinit && apiLevel >= 29) {
         for (const NullProcess::Map& map : this->maps) {
             if (NullUtils::endsWith(map.pathName, "libdl_android.so") && !libdlinit) {
@@ -543,16 +479,17 @@ void NullProcess::Process::locateSymbols() {
                     this->libdl.remote_dlerror = map.start + NullElf::getAddrSym(map.pathName.c_str(), "dlerror");
                     this->libdl.remote_dlsym   = map.start + NullElf::getAddrSym(map.pathName.c_str(), "dlsym");
                     libdlinit = true;
+                    ILOG("libdl_android.so dlopen @ 0x%lx", (unsigned long)this->libdl.remote_dlopen);
                     break;
                 }
             }
         }
     }
 
+    if (!libdlinit) ILOG("locateSymbols: GAGAL temukan dlopen!");
+    if (!libcinit)  ILOG("locateSymbols: GAGAL temukan malloc!");
+
 #elif defined(__i386__) || defined(__x86_64__)
-    // -------------------------------------------------------
-    // x86 / x86_64 (kode lama, sudah handle APEX dengan baik)
-    // -------------------------------------------------------
     for (const NullProcess::Map& map : this->maps) {
         bool notArm = map.pathName.find("/arm/")   == std::string::npos &&
                       map.pathName.find("/arm64/")  == std::string::npos &&
@@ -567,14 +504,12 @@ void NullProcess::Process::locateSymbols() {
                 libdlinit = true;
             }
         }
-
         if (notArm && NullUtils::endsWith(map.pathName, "libc.so") && !libcinit) {
             this->libc.remote_malloc = map.start + NullElf::getAddrSym(map.pathName.c_str(), "malloc");
             this->libc.remote_free   = map.start + NullElf::getAddrSym(map.pathName.c_str(), "free");
             this->libc.remote_mmap   = map.start + NullElf::getAddrSym(map.pathName.c_str(), "mmap");
             if (this->libc.remote_malloc) libcinit = true;
         }
-
         if (notArm && NullUtils::endsWith(map.pathName, "libnativebridge.so")) {
             this->libnativebridge.remote_loadLibraryExt =
                 map.start + NullElf::getAddrSym(map.pathName.c_str(), "LoadLibraryExt", NullElf::CONTAINS);
@@ -588,8 +523,6 @@ void NullProcess::Process::locateSymbols() {
             this->nbInfo.usesCallbacksPtr   = false;
         }
     }
-
-    // Native bridge fallback (houdini / libhoudini)
     NullProcess::Map nbMap = this->findMap("libhoudini.so");
     if (nbMap.pathName.empty()) {
         auto   nbProp = std::array<char, PROP_VALUE_MAX>();
@@ -610,10 +543,9 @@ void NullProcess::Process::locateSymbols() {
 #endif
 }
 
-// ==========================================
+// ============================================================================
 // MAP PARSING
-// ==========================================
-
+// ============================================================================
 NullProcess::Map NullProcess::Process::parseMap(const std::string& line) {
     NullProcess::Map map;
 

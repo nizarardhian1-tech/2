@@ -31,6 +31,20 @@ public class Injector {
     }
 
     // =========================================================================
+    // Path konstan — di sini libinternal.so di-extract oleh extractInternal()
+    // =========================================================================
+    private static final String EXTRACTED_SO_DIR  = "/data/local/tmp/";
+    private static final String EXTRACTED_SO_NAME = "libinternal.so";
+
+    /**
+     * Kembalikan path absolut libinternal.so yang sudah di-extract.
+     * Dipakai oleh ModManager untuk menulis ke config (line 4: soPath).
+     */
+    public String getExtractedSoPath() {
+        return EXTRACTED_SO_DIR + EXTRACTED_SO_NAME;
+    }
+
+    // =========================================================================
     // SELinux permissive
     // =========================================================================
     public void setSelinuxPermissive() {
@@ -47,13 +61,13 @@ public class Injector {
     public boolean extractInternal(String abi) {
         log("Extracting libinternal.so for ABI: " + abi);
 
-        String destDir = "/data/local/tmp/";
+        String destDir = EXTRACTED_SO_DIR;
         runSu("mkdir -p " + destDir);
         runSu("chmod 777 " + destDir);
 
         AssetManager am = ctx.getAssets();
         String assetPath = "jniLibs/" + abi + "/libinternal.so";
-        String destPath  = destDir + "libinternal.so";
+        String destPath  = destDir + EXTRACTED_SO_NAME;
 
         try {
             InputStream      is  = am.open(assetPath);

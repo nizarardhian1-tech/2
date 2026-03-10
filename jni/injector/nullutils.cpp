@@ -45,14 +45,24 @@ int NullUtils::getApiLevel() {
     return std::stoi(sdk_version_str);
 }
 
+// =============================================================================
+// SELINUX helpers
+//
+// FIX: Binary injector sudah dijalankan sebagai root via "su -c ./injector".
+// Jangan pakai "su -c setenforce" karena nested su tidak perlu dan bisa gagal
+// di beberapa implementasi Magisk/KernelSU.
+// Cukup panggil setenforce langsung — kita sudah punya UID 0.
+// =============================================================================
+
 void NullUtils::SELINUX_SetEnforce(int mode) {
-    if (mode == 0)      system("su -c setenforce 0");
-    else if (mode == 1) system("su -c setenforce 1");
+    // Langsung — tanpa "su -c" karena binary sudah root
+    if (mode == 0)      system("setenforce 0");
+    else if (mode == 1) system("setenforce 1");
 }
 
 int NullUtils::SELINUX_GetEnforce() {
     std::ifstream file("/sys/fs/selinux/enforce");
-    if (!file.is_open()) return -1; // silent, no cerr
+    if (!file.is_open()) return -1;
 
     std::string line;
     std::getline(file, line);

@@ -294,9 +294,13 @@ public class MainActivity extends Activity {
             // Step 1: Injector siapkan libinternal.so + wrap-script (jika perlu)
             injector.fullInject(game);
 
-            // Step 2: ModManager jalankan binary injector
-            //   Binary akan: tunggu game → ptrace inject → launch overlay → keepalive
-            modManager.launch(game.packageName);
+            // Dapatkan path aktual libinternal.so yang sudah di-extract oleh Injector.java
+            // Injector.java selalu extract ke /data/local/tmp/libinternal.so
+            // Path ini yang harus dikirim ke binary injector (bukan nativeLibraryDir)
+            String soPath = injector.getExtractedSoPath();
+            log("soPath: " + soPath);
+
+            modManager.launch(game.packageName, soPath);
 
             mainHandler.post(() -> setButtonEnabled(btnInject, true));
         }).start();
