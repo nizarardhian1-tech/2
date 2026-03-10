@@ -298,7 +298,7 @@ public class MainActivity extends Activity {
             // Injector.java selalu extract ke /data/local/tmp/libinternal.so
             // Path ini yang harus dikirim ke binary injector (bukan nativeLibraryDir)
             String soPath = injector.getExtractedSoPath();
-            log("soPath: " + soPath);
+appendLog("soPath: " + soPath);  // ← GANTI log() dengan appendLog()
 
             modManager.launch(game.packageName, soPath);
 
