@@ -114,10 +114,8 @@ int main(int argc, char* argv[]) {
     L("started");
     Lf("filesDir : %s", filesDir.c_str());
 
-    if (!CheckExpiry()) {
-        L("EXPIRED");
-        return 0;
-    }
+    // BuildExpiry dinonaktifkan — injector tidak punya expiry date
+    // (CheckExpiry() dengan EXPIRE_DAYS=1 akan selalu expired setelah 1 hari build)
 
     // ─ Baca config (4 baris) ─────────────────────────────────────────────────
     std::string apkPath, nativeDir, targetPkg, soPath;
